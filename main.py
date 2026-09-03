@@ -374,45 +374,32 @@ class LLMAgent:
         lines: list[str] = [
             f"Tarih: {run_date}",
             "Asagida DonanimHaber forumundan kazinan son 24 saatin firsat mesajlari var.",
-            "Her mesajda: kaynak, yazar, begeni sayisi, mesaj metni ve urun linkleri yer almaktadir.",
             "",
-            "GOREV:",
-            "1. Sahte/sisirilmis indirimleri ve belirsiz kuponlari filtrele.",
-            "2. Kalan firsatlar arasindan EN YUKSEK TASARRUFLU 3-5 urunu 'Trend Firsatlar' olarak sec.",
-            "3. Firsatlari kategorilere ayir: Elektronik | Bilgisayar & Oyun | Ev & Yasam | Supermarket | Moda | Diger",
-            "4. Ciktiyi Telegram HTML formatinda, Turkce olarak uret.",
-            "   - SADECE <b>, <i>, <a href=\"...\">, <code> etiketlerini kullan.",
-            "   - Tum HTML etiketlerinin kapandigindan emin ol.",
-            "   - Metin uzunlugu 3500 karakteri ASMASIN.",
+            "GOREVIN:",
+            "1. Sahte indirimleri ele, en avantajli urunleri sec.",
+            "2. En yuksek tasarruflu 3-5 urunu '🔥 Trend Firsatlar' basligina koy.",
+            "3. Kalan urunleri kategorilere ayir (📱 Elektronik, 🏠 Ev & Yasam, 🛒 Supermarket, 👕 Moda, 🎮 Oyun & Hobi).",
+            "4. Her firsat icin: Urun adi, Fiyat, Satin Al linki, Kaynak site, Begeni sayisi ekle.",
+            "5. SADECE Telegram HTML etiketleri kullan: <b>, <i>, <code>, <a href='...'>.",
+            "6. TUM HTML ETIKETLERINI EKSANSIZ KAPAT.",
             "",
-            "CIKTI FORMATI (Sadece asagidaki blok arasini uret, baska metin yazma):",
-            "---BEGIN---",
-            f"<b>🔥 Gunluk Firsat Bulteni — {run_date}</b>",
-            "",
+            "ORNEK FORMAT:",
+            f"<b>🔥 Gunluk Firsat Bulteni — {run_date}</b>\n",
             "<b>⭐ Trend Firsatlar</b>",
-            "• <b>[Urun Adi]</b> — <code>[Fiyat TL]</code> | <a href=\"[link]\">Satin Al</a> (<i>[Kaynak]</i>) 👍[begeni]",
-            "",
-            "<b>📦 Elektronik</b>",
-            "• ...",
-            "",
-            "<b>🏠 Ev & Yasam</b>",
-            "• ...",
-            "",
-            "<b>🛒 Supermarket</b>",
-            "• ...",
-            "",
-            "<i>📅 Bulten saati: TSI 10:00 | Kaynak: forum.donanimhaber.com</i>",
-            "---END---",
+            "• <b>Philips Airfryer 7.2L</b> — <code>3.499 TL</code> | <a href='https://amazon.com.tr'>Satin Al</a> (<i>Amazon TR</i>) 👍 42\n",
+            "<b>📱 Elektronik</b>",
+            "• <b>Samsung Galaxy Tab S9</b> — <code>12.999 TL</code> | <a href='https://n11.com'>Satin Al</a> (<i>N11</i>) 👍 18\n",
+            "<i>📅 Bulten Saati: TSI 10:00 | Kaynak: DonanimHaber Forum</i>",
             "",
             "FORUM MESAJLARI:",
         ]
 
         for i, p in enumerate(posts, 1):
-            lines.append(f"\n[{i}] Kaynak: {p.source} | Yazar: {p.author} | Begeni: {p.likes}")
-            lines.append(f"    Tarih: {p.post_date.strftime('%d.%m.%Y %H:%M')}")
-            lines.append(f"    Metin: {p.text[:400]}")
+            lines.append(f"[{i}] Kaynak: {p.source} | Yazar: {p.author} | Beğeni: {p.likes}")
+            lines.append(f"    Mesaj: {p.text[:500]}")
             if p.resolved_links:
-                lines.append(f"    Link(ler): {' | '.join(p.resolved_links[:2])}")
+                lines.append(f"    Link: {p.resolved_links[0]}")
+            lines.append("")
 
         return "\n".join(lines)
 
@@ -429,6 +416,13 @@ class LLMAgent:
         last_error = None
         models_to_try = self._discover_models()
 
+        system_instruction = (
+            "Sen Türkiye'nin en büyük teknoloji ve fırsat forumu DonanımHaber için profesyonel "
+            "günlük indirim bülteni hazırlayan yapay zeka asistanısın. "
+            "Görevin en kaliteli indirimleri kategorilere ayırarak ilgi çekici, okunabilir "
+            "ve eksiksiz Telegram HTML formatında sunmaktır."
+        )
+
         for m_name in models_to_try:
             try:
                 logger.info("Trying Gemini model: %s", m_name)
@@ -436,8 +430,9 @@ class LLMAgent:
                     model=m_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
                         temperature=0.3,
-                        max_output_tokens=2048,
+                        max_output_tokens=4096,
                     ),
                 )
                 raw = response.text or ""
@@ -450,8 +445,16 @@ class LLMAgent:
 
         if not raw:
             logger.error("All Gemini models failed. Last error: %s", last_error)
-            return f"<b>⚠️ AI analizi sirasinda hata olustu:</b> <code>{last_error}</code>"
+            return f"<b>⚠️ AI analizi sırasında hata oluştu:</b> <code>{last_error}</code>"
 
+        # Clean markdown code blocks if Gemini wrapped in ```html ... ```
+        raw = re.sub(r"^```(?:html)?\s*", "", raw, flags=re.IGNORECASE | re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
+
+        # Extract between ---BEGIN--- and ---END--- if present, else use full text
+        # Clean markdown wrappers
+        raw = re.sub(r"^```(?:html)?\s*", "", raw, flags=re.IGNORECASE | re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
         match = re.search(r"---BEGIN---\s*(.*?)\s*---END---", raw, re.DOTALL)
         bulletin = match.group(1).strip() if match else raw.strip()
 
