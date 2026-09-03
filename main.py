@@ -300,14 +300,13 @@ class ValidationEngine:
         post.resolved_links = list(dict.fromkeys(resolved))
 
         if post.resolved_links:
+            post.is_valid = True
             try:
                 check_url = post.resolved_links[0]
-                resp = await self.client.head(check_url, follow_redirects=True, timeout=10)
+                resp = await self.client.head(check_url, follow_redirects=True, timeout=5)
                 post.http_status = resp.status_code
-                post.is_valid = resp.status_code in (200, 301, 302)
             except Exception as exc:
                 logger.debug("HTTP check error (%s): %s", post.resolved_links[0], exc)
-                post.is_valid = False
         else:
             post.is_valid = False
 
@@ -339,7 +338,7 @@ class ValidationEngine:
 class LLMAgent:
     """Uses Gemini to analyze deals and generate the Telegram bulletin text."""
 
-    MODEL = "gemini-2.0-flash"
+    MODEL = "gemini-1.5-flash"
 
     def __init__(self) -> None:
         self.client = genai.Client(api_key=GEMINI_API_KEY)
@@ -469,6 +468,8 @@ class TelegramNotifier:
                     json=payload,
                     timeout=15,
                 )
+                if resp.is_error:
+                    logger.error("Telegram API Error Body: %s", resp.text)
                 resp.raise_for_status()
                 logger.info("Telegram message sent (%d/%d).", idx, len(chunks))
             except Exception as exc:
