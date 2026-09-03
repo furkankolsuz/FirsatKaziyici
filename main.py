@@ -338,6 +338,8 @@ class ValidationEngine:
 class LLMAgent:
     """Uses Gemini to analyze deals and generate the Telegram bulletin text."""
 
+    MODEL = "gemini-1.5-flash"
+
     def __init__(self) -> None:
         if not GEMINI_API_KEY:
             raise ValueError("GEMINI_API_KEY is missing!")
@@ -354,14 +356,13 @@ class LLMAgent:
                 if "generateContent" in methods:
                     clean = m_name.replace("models/", "")
                     if "flash" in clean.lower():
-                        candidate_models.insert(0, clean)  # prioritize flash models
+                        candidate_models.insert(0, clean)
                     else:
                         candidate_models.append(clean)
             logger.info("Discovered %d Gemini models dynamically.", len(candidate_models))
         except Exception as exc:
             logger.warning("Could not dynamically list Gemini models: %s", exc)
 
-        # Fallback candidates if discovery returned empty
         fallbacks = ["gemini-1.5-flash-latest", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-pro", "gemini-1.5-pro"]
         for fb in fallbacks:
             if fb not in candidate_models:
@@ -372,46 +373,42 @@ class LLMAgent:
     def _build_prompt(self, posts: list[ForumPost], run_date: str) -> str:
         lines: list[str] = [
             f"Tarih: {run_date}",
-            "Asagida Donan?mHaber forumundan kaz?nan son 24 saatin firsat mesajlari var.",
+            "Asagida DonanimHaber forumundan kazinan son 24 saatin firsat mesajlari var.",
             "Her mesajda: kaynak, yazar, begeni sayisi, mesaj metni ve urun linkleri yer almaktadir.",
             "",
             "GOREV:",
-            "1. Sahte/sisiririlmis indirimleri ve belirsiz kuponlari filtrele.",
-            "2. Kalan firsatlar aras?ndan EN YUKSEK TASARRUFLU 3-5 urunu 'Trend Firsatlar' olarak sec.",
+            "1. Sahte/sisirilmis indirimleri ve belirsiz kuponlari filtrele.",
+            "2. Kalan firsatlar arasindan EN YUKSEK TASARRUFLU 3-5 urunu 'Trend Firsatlar' olarak sec.",
             "3. Firsatlari kategorilere ayir: Elektronik | Bilgisayar & Oyun | Ev & Yasam | Supermarket | Moda | Diger",
-            "4. Cikt?y? asagidaki HTML formatinda, Turkce olarak uretin.",
-            "   - Emoji kullan, okunabilir tut.",
-            "   - Her firsat icin: urun ad?, fiyat, kaynak site, link, kategori.",
-            "   - Telegram HTML parse moduna uygun: <b>, <i>, <a href>, <code> taglari kullan.",
-            "   - 3800 karakteri ASMA (Telegram limiti).",
+            "4. Ciktiyi Telegram HTML formatinda, Turkce olarak uret.",
+            "   - SADECE <b>, <i>, <a href=\"...\">, <code> etiketlerini kullan.",
+            "   - Tum HTML etiketlerinin kapandigindan emin ol.",
+            "   - Metin uzunlugu 3500 karakteri ASMASIN.",
             "",
-            "CIKTI FORMATI (tam bu sekilde, baska hicbir sey yazma):",
+            "CIKTI FORMATI (Sadece asagidaki blok arasini uret, baska metin yazma):",
             "---BEGIN---",
-            "<b>\U0001F525 Gunluk Firsat Bulteni \u2014 {tarih}</b>",
+            f"<b>🔥 Gunluk Firsat Bulteni — {run_date}</b>",
             "",
-            "<b>\u2B50 Trend Firsatlar</b>",
-            "\u2022 <b>[Urun Adi]</b> \u2014 <code>[Fiyat TL]</code> | <a href=\'[link]\'>Satin Al</a> (<i>[Kaynak]</i>) \U0001F44D[begeni]",
-            "...",
+            "<b>⭐ Trend Firsatlar</b>",
+            "• <b>[Urun Adi]</b> — <code>[Fiyat TL]</code> | <a href=\"[link]\">Satin Al</a> (<i>[Kaynak]</i>) 👍[begeni]",
             "",
-            "<b>\U0001F4E6 Elektronik</b>",
-            "\u2022 ...",
+            "<b>📦 Elektronik</b>",
+            "• ...",
             "",
-            "<b>\U0001F3E0 Ev & Yasam</b>",
-            "\u2022 ...",
+            "<b>🏠 Ev & Yasam</b>",
+            "• ...",
             "",
-            "<b>\U0001F6D2 Supermarket</b>",
-            "\u2022 ...",
+            "<b>🛒 Supermarket</b>",
+            "• ...",
             "",
-            "<i>\U0001F4C5 Bulten saati: TSI 10:00 | Kaynak: forum.donanimhaber.com</i>",
+            "<i>📅 Bulten saati: TSI 10:00 | Kaynak: forum.donanimhaber.com</i>",
             "---END---",
             "",
             "FORUM MESAJLARI:",
         ]
 
         for i, p in enumerate(posts, 1):
-            lines.append(
-                f"\n[{i}] Kaynak: {p.source} | Yazar: {p.author} | Begeni: {p.likes}"
-            )
+            lines.append(f"\n[{i}] Kaynak: {p.source} | Yazar: {p.author} | Begeni: {p.likes}")
             lines.append(f"    Tarih: {p.post_date.strftime('%d.%m.%Y %H:%M')}")
             lines.append(f"    Metin: {p.text[:400]}")
             if p.resolved_links:
@@ -422,27 +419,39 @@ class LLMAgent:
     async def analyze(self, posts: list[ForumPost]) -> str:
         """Sends posts to Gemini and returns the bulletin text."""
         if not posts:
-            return "<b>\u2139\uFE0F Bugun paylasilan gecerli bir firsat bulunamadi.</b>"
+            return "<b>ℹ️ Bugun paylasilan gecerli bir firsat bulunamadi.</b>"
 
         run_date = datetime.now(TZ_ISTANBUL).strftime("%d %B %Y")
         prompt = self._build_prompt(posts, run_date)
         logger.info("Sending %d posts to Gemini...", len(posts))
 
-        try:
-            response = self.client.models.generate_content(
-                model=self.MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.3,
-                    max_output_tokens=2048,
-                ),
-            )
-            raw = response.text or ""
-        except Exception as exc:
-            logger.error("Gemini API error: %s", exc)
-            return f"<b>\u26A0\uFE0F AI analizi sirasinda hata olustu:</b> <code>{exc}</code>"
+        raw = ""
+        last_error = None
+        models_to_try = self._discover_models()
 
-        # Extract content between ---BEGIN--- and ---END---
+        for m_name in models_to_try:
+            try:
+                logger.info("Trying Gemini model: %s", m_name)
+                response = self.client.models.generate_content(
+                    model=m_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.3,
+                        max_output_tokens=2048,
+                    ),
+                )
+                raw = response.text or ""
+                if raw:
+                    logger.info("Successfully generated with model: %s", m_name)
+                    break
+            except Exception as exc:
+                logger.warning("Gemini model %s error: %s", m_name, exc)
+                last_error = exc
+
+        if not raw:
+            logger.error("All Gemini models failed. Last error: %s", last_error)
+            return f"<b>⚠️ AI analizi sirasinda hata olustu:</b> <code>{last_error}</code>"
+
         match = re.search(r"---BEGIN---\s*(.*?)\s*---END---", raw, re.DOTALL)
         bulletin = match.group(1).strip() if match else raw.strip()
 
@@ -450,9 +459,7 @@ class LLMAgent:
         return bulletin
 
 
-# ===========================================================================
-# MODULE 4: Telegram Notification
-# ===========================================================================
+
 class TelegramNotifier:
     """Sends messages via Telegram Bot HTTP API."""
 
