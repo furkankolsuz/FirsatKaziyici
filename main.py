@@ -9,33 +9,18 @@ Modules:
 
 from __future__ import annotations
 
-import asyncio
-import re
-import time
-import json
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
-import httpx
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-import os
-import logging
+import asyncio
+import json
 import logging
 import os
 import re
-import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-import json
-from typing import Any
-
 from urllib.parse import urljoin, urlparse, unquote
 
 import httpx
