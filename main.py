@@ -338,10 +338,36 @@ class ValidationEngine:
 class LLMAgent:
     """Uses Gemini to analyze deals and generate the Telegram bulletin text."""
 
-    MODEL = "gemini-1.5-flash"
-
     def __init__(self) -> None:
+        if not GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY is missing!")
         self.client = genai.Client(api_key=GEMINI_API_KEY)
+
+    def _discover_models(self) -> list[str]:
+        """Dynamically discovers models supporting generateContent from Gemini API."""
+        candidate_models: list[str] = []
+        try:
+            available = list(self.client.models.list())
+            for m in available:
+                m_name = getattr(m, "name", "") or str(m)
+                methods = getattr(m, "supported_generation_methods", []) or []
+                if "generateContent" in methods:
+                    clean = m_name.replace("models/", "")
+                    if "flash" in clean.lower():
+                        candidate_models.insert(0, clean)  # prioritize flash models
+                    else:
+                        candidate_models.append(clean)
+            logger.info("Discovered %d Gemini models dynamically.", len(candidate_models))
+        except Exception as exc:
+            logger.warning("Could not dynamically list Gemini models: %s", exc)
+
+        # Fallback candidates if discovery returned empty
+        fallbacks = ["gemini-1.5-flash-latest", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-pro", "gemini-1.5-pro"]
+        for fb in fallbacks:
+            if fb not in candidate_models:
+                candidate_models.append(fb)
+
+        return candidate_models
 
     def _build_prompt(self, posts: list[ForumPost], run_date: str) -> str:
         lines: list[str] = [
