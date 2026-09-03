@@ -423,10 +423,10 @@ class LLMAgent:
         models_to_try = self._discover_models()
 
         system_instruction = (
-            "Sen Türkiye'nin en büyük teknoloji ve fırsat forumu DonanımHaber için profesyonel "
-            "günlük indirim bülteni hazırlayan yapay zeka asistanısın. "
-            "Görevin en kaliteli indirimleri kategorilere ayırarak ilgi çekici, okunabilir "
-            "ve eksiksiz Telegram HTML formatında sunmaktır."
+            "Sen Turkiye'nin en buyuk teknoloji forumu DonanimHaber icin profesyonel gunluk firsat bulteni hazirlayan yapay zekasin. "
+            "Gorevin: Gelen veri setindeki MUKUN OLDUGUNCA COK gecerli firsati yakalayip onlari duzgunce kategorize etmek "
+            "ve temiz, HTML icermeyen, bol urun barindiran, zengin bir bulten olusturmaktir. "
+            "Begeniler (likes) vs asla listelenmemelidir."
         )
 
         for m_name in models_to_try:
@@ -613,7 +613,7 @@ async def main() -> None:
 
             # ---- Module 3: LLM Analysis ----
             agent = LLMAgent()
-            bulletin = await agent.analyze(valid_posts[:30])
+            bulletin = await agent.analyze(valid_posts[:50])
 
             # ---- Module 4: Telegram ----
             await notifier.send(bulletin)
