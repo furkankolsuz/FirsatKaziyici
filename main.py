@@ -473,6 +473,21 @@ class TelegramNotifier:
                 logger.info("Telegram message sent (%d/%d).", idx, len(chunks))
             except Exception as exc:
                 logger.error("Telegram send error (%d/%d): %s", idx, len(chunks), exc)
+                logger.info("Retrying without HTML parse mode...")
+                plain_payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": re.sub(r'<[^>]+>', '', chunk),
+                }
+                try:
+                    r2 = await self.client.post(
+                        f"{TELEGRAM_API_BASE}/sendMessage",
+                        json=plain_payload,
+                        timeout=15,
+                    )
+                    r2.raise_for_status()
+                    logger.info("Telegram plain text fallback sent successfully.")
+                except Exception as e2:
+                    logger.error("Telegram fallback also failed: %s", e2)
             if len(chunks) > 1:
                 await asyncio.sleep(1)
 
@@ -491,12 +506,22 @@ async def main() -> None:
     logger.info("FirsatKaziyici started -- %s", datetime.now(TZ_ISTANBUL).isoformat())
     logger.info("=" * 60)
 
+    missing = []
+    if not GEMINI_API_KEY: missing.append("GEMINI_API_KEY")
+    if not TELEGRAM_BOT_TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID: missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        logger.error("CRITICAL: Missing environment variables: %s", ", ".join(missing))
+
     async with httpx.AsyncClient(
         headers=HEADERS,
         timeout=httpx.Timeout(30.0, connect=10.0),
         follow_redirects=True,
     ) as http_client:
         notifier = TelegramNotifier(http_client)
+        if missing:
+            logger.error("Execution halted due to missing secrets.")
+            return
 
         try:
             # ---- Module 1: Scraping ----
