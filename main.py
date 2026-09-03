@@ -432,7 +432,7 @@ class LLMAgent:
                     config=types.GenerateContentConfig(
                         system_instruction=system_instruction,
                         temperature=0.3,
-                        max_output_tokens=4096,
+                        max_output_tokens=3500,
                     ),
                 )
                 raw = response.text or ""
