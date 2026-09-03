@@ -336,9 +336,7 @@ class ValidationEngine:
 # MODULE 3: AI Analysis
 # ===========================================================================
 class LLMAgent:
-    """Uses Gemini to analyze deals and generate the Telegram bulletin text."""
-
-    MODEL = "gemini-1.5-flash"
+    """Uses Gemini to analyze deals, outputs JSON, and formats Telegram HTML safely."""
 
     def __init__(self) -> None:
         if not GEMINI_API_KEY:
@@ -346,7 +344,6 @@ class LLMAgent:
         self.client = genai.Client(api_key=GEMINI_API_KEY)
 
     def _discover_models(self) -> list[str]:
-        """Dynamically discovers models supporting generateContent from Gemini API."""
         candidate_models: list[str] = []
         try:
             available = list(self.client.models.list())
@@ -359,75 +356,98 @@ class LLMAgent:
                         candidate_models.insert(0, clean)
                     else:
                         candidate_models.append(clean)
-            logger.info("Discovered %d Gemini models dynamically.", len(candidate_models))
-        except Exception as exc:
-            logger.warning("Could not dynamically list Gemini models: %s", exc)
+        except Exception:
+            pass
 
-        fallbacks = ["gemini-2.5-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-2.5-pro", "gemini-1.5-pro"]
+        fallbacks = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-pro"]
         for fb in fallbacks:
             if fb not in candidate_models:
                 candidate_models.append(fb)
-
         return candidate_models
 
-    def _build_prompt(self, posts: list[ForumPost], run_date: str) -> str:
+    def _build_prompt(self, posts: list[ForumPost]) -> str:
         lines: list[str] = [
-            f"Tarih: {run_date}",
-            "Asagida DonanimHaber forumundan kazinan son 24 saatin firsat mesajlari var.",
-            "",
             "GOREVIN:",
-            "1. Sahte indirimleri ele, en avantajli urunleri sec.",
-            "2. En yuksek tasarruflu 3-5 urunu '🔥 Trend Firsatlar' basligina koy.",
-            "3. Kalan urunleri kategorilere ayir (📱 Elektronik, 🏠 Ev & Yasam, 🛒 Supermarket, 👕 Moda, 🎮 Oyun & Hobi).",
-            "4. Her firsat icin: Urun adi, Fiyat, Satin Al linki, Kaynak site, Begeni sayisi ekle.",
-            "5. SADECE Telegram HTML etiketleri kullan: <b>, <i>, <code>, <a href='...'>.",
-            "6. TUM HTML ETIKETLERINI EKSANSIZ KAPAT.",
+            "Sana verilen forum mesajlarindaki gecerli ve indirimli TUM URUNLERI cikar.",
+            "SAKIN eleme yapip 2-3 tane urun birakma! Mesajlarda bulunan butun linkli urunleri JSON'a ekle (10-20 tane olsa bile hepsini ekle).",
+            "Sadece net olarak sahte olanlari veya linki olmayanlari atla.",
+            "Urunleri 'trend_firsatlar', 'elektronik', 'ev_yasam', 'supermarket', 'moda', 'oyun_hobi', 'diger' kategorilerine ayir.",
+            "En iyi, en sicak 5 firsati 'trend_firsatlar' icine koy.",
             "",
-            "ORNEK FORMAT:",
-            f"<b>🔥 Gunluk Firsat Bulteni — {run_date}</b>\n",
-            "<b>⭐ Trend Firsatlar</b>",
-            "• <b>Philips Airfryer 7.2L</b> — <code>3.499 TL</code> | <a href='https://amazon.com.tr'>Satin Al</a> (<i>Amazon TR</i>) 👍 42\n",
-            "<b>📱 Elektronik</b>",
-            "• <b>Samsung Galaxy Tab S9</b> — <code>12.999 TL</code> | <a href='https://n11.com'>Satin Al</a> (<i>N11</i>) 👍 18\n",
-            "<i>📅 Bulten Saati: TSI 10:00 | Kaynak: DonanimHaber Forum</i>",
+            "CIKTI FORMATI KESINLIKLE JSON OLMALIDIR:",
+            "{",
+            "  \"trend_firsatlar\": [",
+            "    {\"urun_adi\": \"Urun Adi\", \"fiyat\": \"1.999 TL\", \"link\": \"https://...\", \"kaynak\": \"Amazon TR\"}",
+            "  ],",
+            "  \"elektronik\": [],",
+            "  \"ev_yasam\": [],",
+            "  \"supermarket\": [],",
+            "  \"moda\": [],",
+            "  \"oyun_hobi\": [],",
+            "  \"diger\": []",
+            "}",
             "",
-            "FORUM MESAJLARI:",
+            "FORUM MESAJLARI:"
         ]
 
         for i, p in enumerate(posts, 1):
-            lines.append(f"[{i}] Kaynak: {p.source} | Yazar: {p.author} | Beğeni: {p.likes}")
-            lines.append(f"    Mesaj: {p.text[:500]}")
+            lines.append(f"[{i}] Kaynak: {p.source}")
+            lines.append(f"    Mesaj: {p.text[:400]}")
             if p.resolved_links:
                 lines.append(f"    Link: {p.resolved_links[0]}")
-            lines.append("")
 
         return "\n".join(lines)
 
+    def _json_to_html(self, data: dict, run_date: str) -> str:
+        """Safely converts structured JSON to Telegram valid HTML."""
+        bulten = f"<b>🔥 Günlük Fırsat Bülteni — {run_date}</b>\n\n"
+        
+        categories = {
+            "trend_firsatlar": "⭐ Trend Fırsatlar",
+            "elektronik": "📱 Elektronik",
+            "ev_yasam": "🏠 Ev & Yaşam",
+            "supermarket": "🛒 Süpermarket",
+            "moda": "👕 Moda",
+            "oyun_hobi": "🎮 Oyun & Hobi",
+            "diger": "📦 Diğer"
+        }
+        
+        total_items = 0
+        for cat_key, cat_name in categories.items():
+            items = data.get(cat_key, [])
+            if items:
+                bulten += f"<b>{cat_name}</b>\n"
+                for item in items:
+                    u_adi = item.get("urun_adi", "Ürün").replace("<", "").replace(">", "")
+                    fiyat = item.get("fiyat", "Belirsiz").replace("<", "").replace(">", "")
+                    link = item.get("link", "#")
+                    kaynak = item.get("kaynak", "Link").replace("<", "").replace(">", "")
+                    if not link.startswith("http"):
+                        link = "#"
+                    bulten += f"• <b>{u_adi}</b> — <code>{fiyat}</code> | <a href='{link}'>Satın Al</a> (<i>{kaynak}</i>)\n"
+                    total_items += 1
+                bulten += "\n"
+        
+        if total_items == 0:
+            return "<b>ℹ️ Bugün kazınan geçerli bir fırsat bulunamadı.</b>"
+
+        bulten += "<i>📅 Kaynak: DonanımHaber Forum</i>"
+        return bulten
+
     async def analyze(self, posts: list[ForumPost]) -> str:
-        """Sends posts to Gemini and returns the bulletin text."""
         if not posts:
             return "<b>ℹ️ Bugun paylasilan gecerli bir firsat bulunamadi.</b>"
 
-        MONTHS_TR = {
-            1: "Ocak", 2: "Subat", 3: "Mart", 4: "Nisan",
-            5: "Mayis", 6: "Haziran", 7: "Temmuz", 8: "Agustos",
-            9: "Eylul", 10: "Ekim", 11: "Kasim", 12: "Aralik"
-        }
         now = datetime.now(TZ_ISTANBUL)
+        MONTHS_TR = {1: "Ocak", 2: "Şubat", 3: "Mart", 4: "Nisan", 5: "Mayıs", 6: "Haziran", 7: "Temmuz", 8: "Ağustos", 9: "Eylül", 10: "Ekim", 11: "Kasım", 12: "Aralık"}
         run_date = f"{now.day} {MONTHS_TR[now.month]} {now.year}"
-        prompt = self._build_prompt(posts, run_date)
-        logger.info("Sending %d posts to Gemini...", len(posts))
+        
+        prompt = self._build_prompt(posts)
+        logger.info("Sending %d posts to Gemini for JSON extraction...", len(posts))
 
         raw = ""
         last_error = None
         models_to_try = self._discover_models()
-
-        system_instruction = (
-            "Sen Turkiye'nin en buyuk teknoloji forumu DonanimHaber icin profesyonel gunluk firsat bulteni hazirlayan yapay zekasin. "
-            "Gorevin: Gelen veri setindeki MUKUN OLDUGUNCA COK gecerli firsati yakalayip onlari duzgunce kategorize etmek "
-            "ve temiz, HTML icermeyen, bol urun barindiran, zengin bir bulten olusturmaktir. "
-            "Begeniler (likes) vs asla listelenmemelidir."
-        )
 
         for m_name in models_to_try:
             try:
@@ -436,9 +456,9 @@ class LLMAgent:
                     model=m_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.3,
-                        max_output_tokens=3500,
+                        temperature=0.2,
+                        response_mime_type="application/json",
+                        max_output_tokens=8000,
                     ),
                 )
                 raw = response.text or ""
@@ -453,20 +473,17 @@ class LLMAgent:
             logger.error("All Gemini models failed. Last error: %s", last_error)
             return f"<b>⚠️ AI analizi sırasında hata oluştu:</b> <code>{last_error}</code>"
 
-        # Clean markdown code blocks if Gemini wrapped in ```html ... ```
-        raw = re.sub(r"^```(?:html)?\s*", "", raw, flags=re.IGNORECASE | re.MULTILINE)
-        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
-
-        # Extract between ---BEGIN--- and ---END--- if present, else use full text
-        # Clean markdown wrappers
-        raw = re.sub(r"^```(?:html)?\s*", "", raw, flags=re.IGNORECASE | re.MULTILINE)
-        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
-        match = re.search(r"---BEGIN---\s*(.*?)\s*---END---", raw, re.DOTALL)
-        bulletin = match.group(1).strip() if match else raw.strip()
-
-        logger.info("Bulletin generated (%d chars).", len(bulletin))
-        return bulletin
-
+        try:
+            # Clean markdown JSON wrappers if Gemini added them despite response_mime_type
+            raw_clean = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE | re.MULTILINE)
+            raw_clean = re.sub(r"\s*```$", "", raw_clean, flags=re.MULTILINE)
+            data = json.loads(raw_clean)
+            bulletin = self._json_to_html(data, run_date)
+            logger.info("JSON successfully parsed and HTML bulletin generated (%d chars).", len(bulletin))
+            return bulletin
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse Gemini JSON: %s\nRaw output: %s", e, raw)
+            return "<b>⚠️ AI veriyi formatlarken hata yaptı.</b>"
 
 
 class TelegramNotifier:
@@ -517,10 +534,11 @@ class TelegramNotifier:
         return chunks
 
     async def _send_chunk(self, chunk: str) -> None:
-        """Sends a single text chunk without HTML parsing."""
+        """Sends a single text chunk with HTML parsing."""
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": chunk,
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
             "link_preview_options": {"is_disabled": True},
         }
@@ -534,20 +552,30 @@ class TelegramNotifier:
         resp.raise_for_status()
 
     async def send(self, text: str) -> None:
-        """Converts HTML to plain text and sends to Telegram."""
+        """Sends cleanly generated HTML to Telegram."""
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.error("Cannot send Telegram message: Credentials missing.")
             return
 
-        plain_text = self.html_to_plain(text)
-        chunks = self._split(plain_text)
+        chunks = self._split(text)
 
         for idx, chunk in enumerate(chunks, 1):
             try:
                 await self._send_chunk(chunk)
                 logger.info("Telegram message sent (%d/%d).", idx, len(chunks))
             except Exception as exc:
-                logger.error("Telegram send error (%d/%d): %s", idx, len(chunks), exc)
+                logger.error("Telegram HTML send error (%d/%d): %s", idx, len(chunks), exc)
+                # Fallback to plain text if somehow HTML still fails
+                plain_payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": re.sub(r'<[^>]+>', '', chunk),
+                    "disable_web_page_preview": True,
+                }
+                try:
+                    r2 = await self.client.post(f"{TELEGRAM_API_BASE}/sendMessage", json=plain_payload, timeout=15)
+                    r2.raise_for_status()
+                except Exception as e2:
+                    logger.error("Telegram fallback failed: %s", e2)
 
             if len(chunks) > 1:
                 await asyncio.sleep(1)
