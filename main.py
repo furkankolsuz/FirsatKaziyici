@@ -10,6 +10,19 @@ Modules:
 from __future__ import annotations
 
 import asyncio
+import re
+import time
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+import httpx
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+import os
+import logging
 import logging
 import os
 import re
@@ -457,9 +470,9 @@ class LLMAgent:
                     model=m_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        temperature=0.2,
+                        temperature=0.1,
                         response_mime_type="application/json",
-                        max_output_tokens=8000,
+                        max_output_tokens=8192,
                     ),
                 )
                 raw = response.text or ""
@@ -494,28 +507,6 @@ class TelegramNotifier:
 
     def __init__(self, client: httpx.AsyncClient) -> None:
         self.client = client
-
-    @staticmethod
-    def html_to_plain(html: str) -> str:
-        """Converts HTML bulletin to clean plain text preserving link URLs."""
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Replace <a href="...">text</a> with "text: url"
-        for a in soup.find_all("a"):
-            href = a.get("href", "")
-            link_text = a.get_text()
-            if href.startswith(("http://", "https://")):
-                a.replace_with(f"{link_text} {href}")
-            else:
-                a.replace_with(link_text)
-
-        # Replace block tags with newlines
-        for tag in soup.find_all(["br", "p", "div", "li"]):
-            tag.replace_with("\n" + tag.get_text())
-
-        plain = soup.get_text()
-        plain = re.sub(r"\n{3,}", "\n\n", plain)
-        return plain.strip()
 
     def _split(self, text: str) -> list[str]:
         """Splits text into Telegram-safe chunks."""
@@ -567,16 +558,7 @@ class TelegramNotifier:
             except Exception as exc:
                 logger.error("Telegram HTML send error (%d/%d): %s", idx, len(chunks), exc)
                 # Fallback to plain text if somehow HTML still fails
-                plain_payload = {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": re.sub(r'<[^>]+>', '', chunk),
-                    "disable_web_page_preview": True,
-                }
-                try:
-                    r2 = await self.client.post(f"{TELEGRAM_API_BASE}/sendMessage", json=plain_payload, timeout=15)
-                    r2.raise_for_status()
-                except Exception as e2:
-                    logger.error("Telegram fallback failed: %s", e2)
+                logger.error("Telegram HTML failed permanently for this chunk.")
 
             if len(chunks) > 1:
                 await asyncio.sleep(1)
@@ -642,7 +624,7 @@ async def main() -> None:
 
             # ---- Module 3: LLM Analysis ----
             agent = LLMAgent()
-            bulletin = await agent.analyze(valid_posts[:50])
+            bulletin = await agent.analyze(valid_posts)
 
             # ---- Module 4: Telegram ----
             await notifier.send(bulletin)
