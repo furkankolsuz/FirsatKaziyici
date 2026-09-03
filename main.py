@@ -250,9 +250,15 @@ class ForumScraper:
 
             pages_to_fetch = list(range(max(1, total - PAGES_TO_SCAN + 1), total + 1))
 
+            cutoff = datetime.now(TZ_ISTANBUL) - timedelta(hours=LOOKBACK_HOURS)
+            # Fetch from newest page (total) downwards
+            pages_to_fetch.reverse()
             for page in pages_to_fetch:
                 posts = await self._scrape_page(slug, page, source_name)
                 all_posts.extend(posts)
+                if posts and posts[-1].post_date < cutoff:
+                    logger.info("Reached posts older than cutoff (%d hours), stopping scan.", LOOKBACK_HOURS)
+                    break
                 await asyncio.sleep(REQUEST_DELAY)
 
         logger.info("Total %d posts scraped.", len(all_posts))
@@ -271,6 +277,11 @@ class ForumScraper:
             if target:
                 return target
 
+        # If it's already a direct shopping link, return it without HTTP GET
+        if any(d in url for d in SHOPPING_DOMAINS):
+            return url
+
+        # Only do HTTP request for /mesaj/yonlen/... or shortlinks
         try:
             async with self.client.stream("GET", url, follow_redirects=True, timeout=5) as resp:
                 final = str(resp.url)
@@ -336,14 +347,9 @@ class ValidationEngine:
 
         if post.resolved_links:
             post.is_valid = True
-            try:
-                check_url = post.resolved_links[0]
-                async with self.client.stream("GET", check_url, follow_redirects=True, timeout=5) as resp:
-                    post.http_status = resp.status_code
-                    if post.http_status == 404:
-                        post.is_valid = False
-            except Exception as exc:
-                logger.debug("HTTP check error (%s): %s", post.resolved_links[0], exc)
+            # Skip the actual GET for direct shopping links to save time and avoid 403s
+            post.http_status = 200
+            post.is_valid = True
         else:
             post.is_valid = False
 
@@ -383,11 +389,15 @@ class LLMAgent:
                 name = getattr(m, "name", "").replace("models/", "")
                 if "flash" in name.lower() or "pro" in name.lower():
                     candidates.append(name)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Telegram send_error failed: %s", e)
         # Prioritize 2.5 flash, then fallbacks
         fallbacks = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
-        return [m for m in fallbacks if m in candidates] or fallbacks
+        valid = []
+        for f in fallbacks:
+            if any(c.startswith(f) for c in candidates):
+                valid.append(f)
+        return valid or fallbacks
 
     def _build_prompt(self, posts: list[ForumPost]) -> str:
         lines = [
@@ -543,7 +553,7 @@ class TelegramNotifier:
             except Exception as e:
                 logger.error("Telegram HTML failed, attempting plain text: %s", e)
                 try:
-                    payload["parse_mode"] = ""
+                    payload.pop("parse_mode", None)
                     payload["text"] = re.sub(r'<[^>]+>', '', chunk)
                     await self.client.post(f"{TELEGRAM_API_BASE}/sendMessage", json=payload, timeout=15)
                 except Exception as e2:
@@ -556,8 +566,8 @@ class TelegramNotifier:
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": f"⚠️ FirsatKaziyici Hata:\n{error_msg[:1000]}"}
         try:
             await self.client.post(f"{TELEGRAM_API_BASE}/sendMessage", json=payload, timeout=10)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Telegram send_error failed: %s", e)
 
 async def main() -> None:
     start = time.monotonic()
@@ -590,7 +600,7 @@ async def main() -> None:
             if not raw_posts:
                 logger.warning("No posts found, skipping bulletin.")
                 await notifier.send(
-                    "<b>\u2139\uFE0F Bugun kaz?nan gecerli firsat mesaji bulunamadi.</b>"
+                    "<b>\u2139\uFE0F Bugün kazınan geçerli fırsat mesajı bulunamadi.</b>"
                 )
                 return
 

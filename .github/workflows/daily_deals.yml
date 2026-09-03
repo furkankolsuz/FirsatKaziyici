@@ -24,6 +24,13 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
+      - name: Cache seen IDs
+        uses: actions/cache@v4
+        with:
+          path: seen_ids.json
+          key: seen-ids-v1
+          restore-keys: seen-ids-
+
       - name: Run FirsatKaziyici
         env:
           GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
