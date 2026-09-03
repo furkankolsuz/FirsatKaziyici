@@ -13,6 +13,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -272,9 +273,11 @@ class ForumScraper:
         try:
             async with self.client.stream("GET", url, follow_redirects=True, timeout=5) as resp:
                 final = str(resp.url)
+                if resp.status_code == 404:
+                    return None
             if any(d in final for d in SHOPPING_DOMAINS):
                 return final
-            return str(resp.url)
+            return None
         except Exception:
             return None
 
@@ -282,6 +285,25 @@ class ForumScraper:
 # ===========================================================================
 # MODULE 2: Validation & Pre-filtering
 # ===========================================================================
+
+SEEN_FILE = "seen_ids.json"
+
+def load_seen() -> set[str]:
+    try:
+        if os.path.exists(SEEN_FILE):
+            with open(SEEN_FILE, "r", encoding="utf-8") as file:
+                return set(json.load(file))
+    except Exception:
+        pass
+    return set()
+
+def save_seen(seen: set[str]) -> None:
+    try:
+        with open(SEEN_FILE, "w", encoding="utf-8") as file:
+            json.dump(list(seen), file)
+    except Exception:
+        pass
+
 class ValidationEngine:
     """
     - Resolves forum redirect links to real product URLs.
@@ -317,6 +339,8 @@ class ValidationEngine:
                 check_url = post.resolved_links[0]
                 async with self.client.stream("GET", check_url, follow_redirects=True, timeout=5) as resp:
                     post.http_status = resp.status_code
+                    if post.http_status == 404:
+                        post.is_valid = False
             except Exception as exc:
                 logger.debug("HTTP check error (%s): %s", post.resolved_links[0], exc)
         else:
@@ -400,12 +424,12 @@ class LLMAgent:
             if items:
                 bulten += f"<b>{cat_name}</b>\n"
                 for item in items:
-                    u_adi = item.get("urun_adi", "Ürün").replace("<", "").replace(">", "")
-                    fiyat = item.get("fiyat", "Belirsiz").replace("<", "").replace(">", "")
-                    link = item.get("link", "#")
-                    kaynak = item.get("kaynak", "Link").replace("<", "").replace(">", "")
+                    u_adi = html.escape(str(item.get("urun_adi", "Ürün")))
+                    fiyat = html.escape(str(item.get("fiyat", "Belirsiz")))
+                    link = str(item.get("link", "#"))
+                    kaynak = html.escape(str(item.get("kaynak", "Link")))
                     if not link.startswith("http"): link = "#"
-                    bulten += f"• <b>{u_adi}</b> — <code>{fiyat}</code> | <a href='{link}'>Satın Al</a> (<i>{kaynak}</i>)\n"
+                    bulten += f'• <b>{u_adi}</b> — <code>{fiyat}</code> | <a href="{html.escape(link, quote=True)}">Satın Al</a> (<i>{kaynak}</i>)\n'
                     total_items += 1
                 bulten += "\n"
         if total_items == 0: return "<b>ℹ️ Bugün kazınan geçerli bir fırsat bulunamadı.</b>"
@@ -424,14 +448,14 @@ class LLMAgent:
         last_error = None
         for m_name in self._discover_models():
             try:
-                response = self.client.models.generate_content(
+                response = await self.client.aio.models.generate_content(
                     model=m_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.1,
                         system_instruction=sys_instr,
                         response_mime_type="application/json",
-                        max_output_tokens=8192,
+                        max_output_tokens=32000,
                     ),
                 )
                 raw = response.text or ""
@@ -495,7 +519,13 @@ class TelegramNotifier:
                 resp = await self.client.post(f"{TELEGRAM_API_BASE}/sendMessage", json=payload, timeout=15)
                 resp.raise_for_status()
             except Exception as e:
-                pass
+                logger.error("Telegram HTML failed, attempting plain text: %s", e)
+                try:
+                    payload["parse_mode"] = ""
+                    payload["text"] = re.sub(r'<[^>]+>', '', chunk)
+                    await self.client.post(f"{TELEGRAM_API_BASE}/sendMessage", json=payload, timeout=15)
+                except Exception as e2:
+                    logger.error("Telegram plain text fallback also failed: %s", e2)
             if len(chunks) > 1: await asyncio.sleep(1)
 
 
@@ -545,24 +575,26 @@ async def main() -> None:
             # ---- Module 2: Validation ----
             validator = ValidationEngine(http_client, scraper)
             valid_posts = await validator.validate_all(raw_posts)
+            
+            seen_ids = load_seen()
+            new_posts = [p for p in valid_posts if p.message_id not in seen_ids]
+            new_posts.sort(key=lambda p: (p.likes, p.post_date.timestamp()), reverse=True)
 
-            # Fallback: add liked posts if too few valid ones
-            if len(valid_posts) < 3:
-                logger.info("Few valid posts, adding liked posts as fallback...")
-                liked = sorted(raw_posts, key=lambda p: p.likes, reverse=True)[:10]
-                for p in liked:
-                    if p not in valid_posts:
-                        valid_posts.append(p)
-
-            # Sort by likes descending
-            valid_posts.sort(key=lambda p: (p.likes, p.post_date.timestamp()), reverse=True)
+            if not new_posts:
+                logger.warning("No new valid posts found after filtering seen_ids.")
+                await notifier.send("<b>ℹ️ Taranan sayfalarda yeni fırsat bulunamadı.</b>")
+                return
 
             # ---- Module 3: LLM Analysis ----
             agent = LLMAgent()
-            bulletin = await agent.analyze(valid_posts)
+            bulletin = await agent.analyze(new_posts)
 
             # ---- Module 4: Telegram ----
             await notifier.send(bulletin)
+            
+            # Save state
+            seen_ids.update(p.message_id for p in new_posts)
+            save_seen(seen_ids)
 
         except Exception as exc:
             logger.exception("Critical error: %s", exc)
