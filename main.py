@@ -464,12 +464,34 @@ class LLMAgent:
 
 
 class TelegramNotifier:
-    """Sends messages via Telegram Bot HTTP API."""
+    """Sends messages via Telegram Bot HTTP API using plain text + URLs."""
 
-    MAX_LEN = 4096
+    MAX_LEN = 4000
 
     def __init__(self, client: httpx.AsyncClient) -> None:
         self.client = client
+
+    @staticmethod
+    def html_to_plain(html: str) -> str:
+        """Converts HTML bulletin to clean plain text preserving link URLs."""
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Replace <a href="...">text</a> with "text: url"
+        for a in soup.find_all("a"):
+            href = a.get("href", "")
+            link_text = a.get_text()
+            if href.startswith(("http://", "https://")):
+                a.replace_with(f"{link_text} {href}")
+            else:
+                a.replace_with(link_text)
+
+        # Replace block tags with newlines
+        for tag in soup.find_all(["br", "p", "div", "li"]):
+            tag.replace_with("\n" + tag.get_text())
+
+        plain = soup.get_text()
+        plain = re.sub(r"\n{3,}", "\n\n", plain)
+        return plain.strip()
 
     def _split(self, text: str) -> list[str]:
         """Splits text into Telegram-safe chunks."""
@@ -488,49 +510,45 @@ class TelegramNotifier:
             text = text[cut:].lstrip("\n")
         return chunks
 
+    async def _send_chunk(self, chunk: str) -> None:
+        """Sends a single text chunk without HTML parsing."""
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "disable_web_page_preview": True,
+            "link_preview_options": {"is_disabled": True},
+        }
+        resp = await self.client.post(
+            f"{TELEGRAM_API_BASE}/sendMessage",
+            json=payload,
+            timeout=15,
+        )
+        if resp.is_error:
+            logger.error("Telegram API Error: %s", resp.text)
+        resp.raise_for_status()
+
     async def send(self, text: str) -> None:
-        """Sends message chunks to the configured chat ID."""
-        chunks = self._split(text)
+        """Converts HTML to plain text and sends to Telegram."""
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.error("Cannot send Telegram message: Credentials missing.")
+            return
+
+        plain_text = self.html_to_plain(text)
+        chunks = self._split(plain_text)
+
         for idx, chunk in enumerate(chunks, 1):
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": chunk,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            }
             try:
-                resp = await self.client.post(
-                    f"{TELEGRAM_API_BASE}/sendMessage",
-                    json=payload,
-                    timeout=15,
-                )
-                if resp.is_error:
-                    logger.error("Telegram API Error Body: %s", resp.text)
-                resp.raise_for_status()
+                await self._send_chunk(chunk)
                 logger.info("Telegram message sent (%d/%d).", idx, len(chunks))
             except Exception as exc:
                 logger.error("Telegram send error (%d/%d): %s", idx, len(chunks), exc)
-                logger.info("Retrying without HTML parse mode...")
-                plain_payload = {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": re.sub(r'<[^>]+>', '', chunk),
-                }
-                try:
-                    r2 = await self.client.post(
-                        f"{TELEGRAM_API_BASE}/sendMessage",
-                        json=plain_payload,
-                        timeout=15,
-                    )
-                    r2.raise_for_status()
-                    logger.info("Telegram plain text fallback sent successfully.")
-                except Exception as e2:
-                    logger.error("Telegram fallback also failed: %s", e2)
+
             if len(chunks) > 1:
                 await asyncio.sleep(1)
 
     async def send_error(self, error_msg: str) -> None:
         """Sends a short error notification."""
-        text = f"<b>\u26A0\uFE0F FirsatKaziyici Hata</b>\n<code>{error_msg[:300]}</code>"
+        text = f"⚠️ FirsatKaziyici Hata:\n{error_msg[:300]}"
         await self.send(text)
 
 
