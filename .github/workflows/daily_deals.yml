@@ -2,14 +2,14 @@ name: Daily Deal Bulletin
 
 on:
   schedule:
-    - cron: '0 7 * * *'
+    - cron: '0 4 * * *'
   workflow_dispatch:
 
 jobs:
   scrape-and-notify:
     name: Scrape Deals and Send to Telegram
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Code
@@ -30,6 +30,6 @@ jobs:
           TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
           LOOKBACK_HOURS: '26'
-          PAGES_TO_SCAN:  '2'
+          PAGES_TO_SCAN:  '10'
           REQUEST_DELAY:  '2.0'
         run: python main.py

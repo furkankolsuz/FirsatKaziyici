@@ -217,9 +217,10 @@ class ForumScraper:
                 if "ExternalLinkRedirect" in href or "/mesaj/yonlen" in href:
                     data_href = a.get("data-href", "")
                     if data_href and "donanimhaber" not in data_href:
-                        raw_links.append(
-                            data_href if data_href.startswith("http") else "https://" + data_href
-                        )
+                        if data_href.startswith("http"):
+                            raw_links.append(data_href)
+                        elif "." in data_href and "/" in data_href:
+                            raw_links.append("https://" + data_href)
                     else:
                         raw_links.append(urljoin(FORUM_BASE, href))
                 elif any(d in href for d in SHOPPING_DOMAINS):
@@ -376,7 +377,17 @@ class LLMAgent:
         self.client = genai.Client(api_key=GEMINI_API_KEY)
 
     def _discover_models(self) -> list[str]:
-        return ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"]
+        candidates = []
+        try:
+            for m in self.client.models.list():
+                name = getattr(m, "name", "").replace("models/", "")
+                if "flash" in name.lower() or "pro" in name.lower():
+                    candidates.append(name)
+        except Exception:
+            pass
+        # Prioritize 2.5 flash, then fallbacks
+        fallbacks = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+        return [m for m in fallbacks if m in candidates] or fallbacks
 
     def _build_prompt(self, posts: list[ForumPost]) -> str:
         lines = [
@@ -493,7 +504,18 @@ class TelegramNotifier:
         current_chunk = ""
         
         for p in paragraphs:
-            if len(current_chunk) + len(p) + 2 <= max_len:
+            if len(p) > max_len:
+                # Fallback to line splitting if paragraph is huge
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+                for line in p.split("\n"):
+                    if len(current_chunk) + len(line) + 1 <= max_len:
+                        current_chunk += line + "\n"
+                    else:
+                        if current_chunk: chunks.append(current_chunk.strip())
+                        current_chunk = line + "\n"
+            elif len(current_chunk) + len(p) + 2 <= max_len:
                 current_chunk += p + "\n\n"
             else:
                 if current_chunk:
