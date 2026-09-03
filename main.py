@@ -363,7 +363,7 @@ class LLMAgent:
         except Exception as exc:
             logger.warning("Could not dynamically list Gemini models: %s", exc)
 
-        fallbacks = ["gemini-1.5-flash-latest", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-pro", "gemini-1.5-pro"]
+        fallbacks = ["gemini-2.5-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-2.5-pro", "gemini-1.5-pro"]
         for fb in fallbacks:
             if fb not in candidate_models:
                 candidate_models.append(fb)
@@ -408,7 +408,13 @@ class LLMAgent:
         if not posts:
             return "<b>ℹ️ Bugun paylasilan gecerli bir firsat bulunamadi.</b>"
 
-        run_date = datetime.now(TZ_ISTANBUL).strftime("%d %B %Y")
+        MONTHS_TR = {
+            1: "Ocak", 2: "Subat", 3: "Mart", 4: "Nisan",
+            5: "Mayis", 6: "Haziran", 7: "Temmuz", 8: "Agustos",
+            9: "Eylul", 10: "Ekim", 11: "Kasim", 12: "Aralik"
+        }
+        now = datetime.now(TZ_ISTANBUL)
+        run_date = f"{now.day} {MONTHS_TR[now.month]} {now.year}"
         prompt = self._build_prompt(posts, run_date)
         logger.info("Sending %d posts to Gemini...", len(posts))
 
@@ -558,7 +564,7 @@ class TelegramNotifier:
 async def main() -> None:
     start = time.monotonic()
     logger.info("=" * 60)
-    logger.info("FirsatKaziyici started -- %s", datetime.now(TZ_ISTANBUL).isoformat())
+    logger.info("FirsatKaziyici v2.0 started -- %s", datetime.now(TZ_ISTANBUL).isoformat())
     logger.info("=" * 60)
 
     missing = []
