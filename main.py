@@ -85,13 +85,13 @@ HEADERS = {
 # Istanbul timezone = UTC+3
 TZ_ISTANBUL = timezone(timedelta(hours=3))
 
-GEMINI_API_KEY: str = os.environ["GEMINI_API_KEY"]
-TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID: str = os.environ["TELEGRAM_CHAT_ID"]
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 LOOKBACK_HOURS: int = int(os.getenv("LOOKBACK_HOURS", "26"))
-PAGES_TO_SCAN: int = int(os.getenv("PAGES_TO_SCAN", "2"))
+PAGES_TO_SCAN: int = int(os.getenv("PAGES_TO_SCAN", "10"))
 REQUEST_DELAY: float = float(os.getenv("REQUEST_DELAY", "2.0"))
 
 # ---------------------------------------------------------------------------
@@ -257,11 +257,20 @@ class ForumScraper:
         return all_posts
 
     async def resolve_redirect(self, url: str) -> Optional[str]:
-        """Resolves forum redirect URLs (/mesaj/yonlen/...) to the actual product URL."""
+        """Resolves forum redirect URLs statically or via HEAD if necessary."""
+        from urllib.parse import parse_qs, urlparse
+        
         if not url.startswith("http"):
             url = "https://" + url
+            
+        if "ExternalLinkRedirect" in url:
+            qs = parse_qs(urlparse(url).query)
+            target = qs.get("url", [None])[0]
+            if target:
+                return target
+
         try:
-            async with self.client.stream("GET", url, follow_redirects=True, timeout=8) as resp:
+            async with self.client.stream("GET", url, follow_redirects=True, timeout=5) as resp:
                 final = str(resp.url)
             if any(d in final for d in SHOPPING_DOMAINS):
                 return final
@@ -343,7 +352,7 @@ class LLMAgent:
         self.client = genai.Client(api_key=GEMINI_API_KEY)
 
     def _discover_models(self) -> list[str]:
-        return ["gemini-2.5-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]
+        return ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"]
 
     def _build_prompt(self, posts: list[ForumPost]) -> str:
         lines = [
@@ -371,7 +380,7 @@ class LLMAgent:
         for i, p in enumerate(posts, 1):
             lines.append(f"[{i}] Kaynak: {p.source}")
             lines.append(f"    Mesaj: {p.text[:400]}")
-            if p.resolved_links: lines.append(f"    Link: {p.resolved_links[0]}")
+            if p.resolved_links: lines.append(f"    Linkler: {', '.join(p.resolved_links)}")
         return "\n".join(lines)
 
     def _json_to_html(self, data: dict, run_date: str) -> str:
@@ -409,7 +418,7 @@ class LLMAgent:
         MONTHS_TR = {1: "Ocak", 2: "Şubat", 3: "Mart", 4: "Nisan", 5: "Mayıs", 6: "Haziran", 7: "Temmuz", 8: "Ağustos", 9: "Eylül", 10: "Ekim", 11: "Kasım", 12: "Aralık"}
         run_date = f"{now.day} {MONTHS_TR[now.month]} {now.year}"
         prompt = self._build_prompt(posts)
-        sys_instr = "Tüm geçerli ürünleri bulan bir JSON API'sisin. SADECE JSON CIKTISI VER."
+        sys_instr = "Tüm geçerli ürünleri bulan bir JSON API'sisin. SADECE GEÇERLİ (VALID) JSON CIKTISI VER. JSON string'leri içinde çift tırnak kullanırken kaçış (escape) yap."
         
         raw = ""
         last_error = None
@@ -442,7 +451,8 @@ class LLMAgent:
             data = json.loads(raw_clean)
             return self._json_to_html(data, run_date)
         except Exception as e:
-            return "<b>⚠️ JSON Hatası:</b>"
+            logger.error("JSON Hatasi. Raw output: %s", raw)
+            return f"<b>⚠️ JSON Hatası:</b> <code>{e}</code>\n\nRaw Data:\n<code>{raw[:500]}</code>"
 
 
 class TelegramNotifier:
@@ -452,15 +462,23 @@ class TelegramNotifier:
     def _split(self, text: str) -> list[str]:
         max_len = 4000
         if len(text) <= max_len: return [text]
+        
+        # Split safely by double newline (paragraphs/items) to avoid breaking HTML tags mid-line
         chunks = []
-        while text:
-            if len(text) <= max_len:
-                chunks.append(text)
-                break
-            cut = text.rfind("\n", 0, max_len)
-            if cut == -1: cut = max_len
-            chunks.append(text[:cut])
-            text = text[cut:].lstrip("\n")
+        paragraphs = text.split("\n\n")
+        current_chunk = ""
+        
+        for p in paragraphs:
+            if len(current_chunk) + len(p) + 2 <= max_len:
+                current_chunk += p + "\n\n"
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = p + "\n\n"
+                
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+            
         return chunks
 
     async def send(self, text: str) -> None:
@@ -480,6 +498,14 @@ class TelegramNotifier:
                 pass
             if len(chunks) > 1: await asyncio.sleep(1)
 
+
+    async def send_error(self, error_msg: str) -> None:
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": f"⚠️ FirsatKaziyici Hata:\n{error_msg[:1000]}"}
+        try:
+            await self.client.post(f"{TELEGRAM_API_BASE}/sendMessage", json=payload, timeout=10)
+        except Exception:
+            pass
 
 async def main() -> None:
     start = time.monotonic()
@@ -529,7 +555,7 @@ async def main() -> None:
                         valid_posts.append(p)
 
             # Sort by likes descending
-            valid_posts.sort(key=lambda p: p.likes, reverse=True)
+            valid_posts.sort(key=lambda p: (p.likes, p.post_date.timestamp()), reverse=True)
 
             # ---- Module 3: LLM Analysis ----
             agent = LLMAgent()
