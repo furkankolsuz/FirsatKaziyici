@@ -1,19 +1,42 @@
 """
-FirsatKaziyici - DonanimHaber Forum Deal Scraper & Telegram Bulletin
+FirsatKaziyici - Donan?mHaber Forum Deal Scraper & Telegram Bulletin
+Modules:
+  - Module 1: Web Scraping (ForumScraper)
+  - Module 2: Validation & Pre-filtering (ValidationEngine)
+  - Module 3: AI Analysis (LLMAgent)
+  - Module 4: Telegram Notification (TelegramNotifier)
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+import httpx
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+import os
+import logging
 import logging
 import os
 import re
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
-from urllib.parse import urljoin, urlparse
+from typing import Optional, Any
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+import json
+from typing import Any
+
+from urllib.parse import urljoin, urlparse, unquote
 
 import httpx
 from bs4 import BeautifulSoup
@@ -23,34 +46,9 @@ from google.genai import types
 
 load_dotenv()
 
-# ===========================================================================
-# CONFIGURATION
-# ===========================================================================
-FORUM_BASE_URL = "https://forum.donanimhaber.com"
-TARGET_URLS = [
-    "https://forum.donanimhaber.com/amazon-turkiye-ve-firsatlari-ana-konu--135048063",
-    "https://forum.donanimhaber.com/pazarama-firsatlari-ve-indirimleri-5-tl-ye-alisveris--157031926",
-    "https://forum.donanimhaber.com/n11-indirimleri-firsatlari-ve-kampanyalari-ana-konu--156735400",
-]
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-TZ_ISTANBUL = timezone(timedelta(hours=3))
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/115.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -58,182 +56,315 @@ logging.basicConfig(
 )
 logger = logging.getLogger("firsatkaziyici")
 
-# ===========================================================================
-# MODELS
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+FORUM_BASE = "https://forum.donanimhaber.com"
+REDIRECT_BASE = f"{FORUM_BASE}/mesaj/yonlen"
+
+FORUM_SOURCES: dict[str, dict] = {
+    "Amazon TR": {
+        "url": f"{FORUM_BASE}/amazon-turkiye-ve-firsatlari-ana-konu--135048063",
+        "slug": "amazon-turkiye-ve-firsatlari-ana-konu--135048063",
+    },
+    "Pazarama": {
+        "url": f"{FORUM_BASE}/pazarama-firsatlari-ve-indirimleri-5-tl-ye-alisveris--157031926",
+        "slug": "pazarama-firsatlari-ve-indirimleri-5-tl-ye-alisveris--157031926",
+    },
+    "N11": {
+        "url": f"{FORUM_BASE}/n11-indirimleri-firsatlari-ve-kampanyalari-ana-konu--156735400",
+        "slug": "n11-indirimleri-firsatlari-ve-kampanyalari-ana-konu--156735400",
+    },
+}
+
+SHOPPING_DOMAINS = (
+    "amazon.com.tr",
+    "pazarama.com",
+    "n11.com",
+    "trendyol.com",
+    "hepsiburada.com",
+    "gittigidiyor.com",
+)
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Referer": "https://forum.donanimhaber.com/",
+}
+
+# Istanbul timezone = UTC+3
+TZ_ISTANBUL = timezone(timedelta(hours=3))
+
+GEMINI_API_KEY: str = os.environ["GEMINI_API_KEY"]
+TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID: str = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+LOOKBACK_HOURS: int = int(os.getenv("LOOKBACK_HOURS", "26"))
+PAGES_TO_SCAN: int = int(os.getenv("PAGES_TO_SCAN", "2"))
+REQUEST_DELAY: float = float(os.getenv("REQUEST_DELAY", "2.0"))
+
+# ---------------------------------------------------------------------------
+# Data Model
+# ---------------------------------------------------------------------------
 @dataclass
 class ForumPost:
-    post_id: str
+    """Represents a single forum post/message."""
+    source: str                    # Amazon TR / Pazarama / N11
+    message_id: str
     author: str
+    post_date: datetime
     text: str
+    likes: int
     raw_links: list[str] = field(default_factory=list)
     resolved_links: list[str] = field(default_factory=list)
-    post_date: datetime = field(default_factory=lambda: datetime.now(TZ_ISTANBUL))
-    source: str = ""
-    likes: int = 0
+    is_valid: bool = False
+    http_status: Optional[int] = None
+
 
 # ===========================================================================
-# MODULE 1: SCRAPER
+# MODULE 1: Web Scraping
 # ===========================================================================
 class ForumScraper:
+    """Scrapes the last pages of Donan?mHaber forum threads."""
+
     def __init__(self, client: httpx.AsyncClient) -> None:
         self.client = client
 
-    async def get_page(self, url: str) -> str:
-        resp = await self.client.get(url, timeout=15)
-        resp.raise_for_status()
-        return resp.text
-
-    def extract_total_pages(self, html: str) -> int:
-        soup = BeautifulSoup(html, "html.parser")
-        pag = soup.find("ul", class_="pagination")
-        if not pag:
+    async def _get_total_pages(self, slug: str) -> int:
+        """Returns total page count for a forum thread."""
+        url = f"{FORUM_BASE}/{slug}"
+        try:
+            resp = await self.client.get(url, follow_redirects=True)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("Could not get page count (%s): %s", slug, exc)
             return 1
-        links = pag.find_all("a")
-        for link in reversed(links):
-            if link.text.strip().isdigit():
-                return int(link.text.strip())
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # From JS variable: totalPageCount: 22126
+        match = re.search(r"totalPageCount\s*:\s*(\d+)", resp.text)
+        if match:
+            return int(match.group(1))
+
+        # From last pagination link
+        end_arrow = soup.select_one("a img.end-arrow")
+        if end_arrow:
+            parent = end_arrow.parent
+            if parent and parent.get("href"):
+                m = re.search(r"-(\d+)$", parent["href"])
+                if m:
+                    return int(m.group(1))
+
         return 1
 
-    def parse_posts(self, html: str, source_name: str) -> list[ForumPost]:
-        soup = BeautifulSoup(html, "html.parser")
+    async def _scrape_page(self, slug: str, page: int, source_name: str) -> list[ForumPost]:
+        """Parses all posts from a single forum page."""
+        url = f"{FORUM_BASE}/{slug}-{page}" if page > 1 else f"{FORUM_BASE}/{slug}"
+        logger.info("Scraping: %s (page %d)", source_name, page)
+
+        try:
+            resp = await self.client.get(url, follow_redirects=True)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.error("Failed to fetch page (%s p%d): %s", source_name, page, exc)
+            return []
+
+        soup = BeautifulSoup(resp.text, "html.parser")
         posts: list[ForumPost] = []
-        msg_divs = soup.find_all("div", class_="msg-border")
 
-        for msg in msg_divs:
+        cutoff = datetime.now(TZ_ISTANBUL) - timedelta(hours=LOOKBACK_HOURS)
+
+        # Each <li id="mess_..."> is one post
+        for li in soup.select("li[id^='mess_']"):
+            msg_id = li.get("data-id", "")
+
+            # Date from <time datetime="...">
+            time_tag = li.select_one("time[datetime]")
+            if not time_tag:
+                continue
             try:
-                author_tag = msg.find("div", class_="msg-info").find("a", class_="ki")
-                author = author_tag.text.strip() if author_tag else "Bilinmiyor"
-                post_id = msg.get("id", "") or "Bilinmiyor"
+                dt_str = time_tag["datetime"]
+                post_dt = datetime.fromisoformat(dt_str)
+                if post_dt.tzinfo is None:
+                    post_dt = post_dt.replace(tzinfo=TZ_ISTANBUL)
+            except (ValueError, KeyError):
+                continue
 
-                text_div = msg.find("div", class_="msg-text")
-                if not text_div:
-                    continue
-                content = text_div.get_text(separator="\n", strip=True)
+            # Time filter
+            if post_dt < cutoff:
+                continue
 
-                raw_links = []
-                for a_tag in text_div.find_all("a", href=True):
-                    href = a_tag["href"]
-                    if href.startswith("/store/"):
-                        href = urljoin(FORUM_BASE_URL, href)
+            # Author
+            author_tag = (
+                li.select_one(".ki-kullaniciadi a b")
+                or li.select_one(".ki-kullaniciadi a")
+            )
+            author = author_tag.get_text(strip=True) if author_tag else "Unknown"
+
+            # Message text
+            content_div = (
+                li.select_one(".icerik .msg")
+                or li.select_one(f"section#messTable_{msg_id}")
+                or li.select_one("span.msg")
+            )
+            text = content_div.get_text(separator=" ", strip=True) if content_div else ""
+
+            # Like count
+            like_el = li.select_one("a[class*='begeni']")
+            likes = 0
+            if like_el:
+                m = re.search(r"(\d+)", like_el.get_text(strip=True))
+                if m:
+                    likes = int(m.group(1))
+
+            # Extract links (forum redirects + direct shopping links)
+            raw_links: list[str] = []
+            for a in li.select("a[href]"):
+                href = a["href"]
+                if "ExternalLinkRedirect" in href or "/mesaj/yonlen" in href:
+                    data_href = a.get("data-href", "")
+                    if data_href and "donanimhaber" not in data_href:
+                        raw_links.append(
+                            data_href if data_href.startswith("http") else "https://" + data_href
+                        )
+                    else:
+                        raw_links.append(urljoin(FORUM_BASE, href))
+                elif any(d in href for d in SHOPPING_DOMAINS):
                     raw_links.append(href)
 
-                date_str = "Bilinmiyor"
-                date_tag = msg.find("div", class_="upb")
-                if date_tag:
-                    dt = date_tag.find("time")
-                    date_str = dt.text.strip() if dt else date_tag.text.strip()
+            posts.append(ForumPost(
+                source=source_name,
+                message_id=msg_id,
+                author=author,
+                post_date=post_dt,
+                text=text[:800],
+                likes=likes,
+                raw_links=list(dict.fromkeys(raw_links)),
+            ))
 
-                likes = 0
-                like_tag = msg.find("span", class_="sayiArti")
-                if like_tag and like_tag.text.strip().isdigit():
-                    likes = int(like_tag.text.strip())
-
-                posts.append(
-                    ForumPost(
-                        post_id=post_id,
-                        author=author,
-                        text=content,
-                        raw_links=raw_links,
-                        source=source_name,
-                        likes=likes,
-                    )
-                )
-            except Exception as e:
-                logger.debug("Eski veya bozuk bir mesaj atlaniyor: %s", e)
+        logger.info("  -> %d new posts found (last %d hours)", len(posts), LOOKBACK_HOURS)
         return posts
 
     async def scrape_all(self) -> list[ForumPost]:
+        """Scrapes all configured forum sources."""
         all_posts: list[ForumPost] = []
-        for url in TARGET_URLS:
-            try:
-                html = await self.get_page(url)
-                soup = BeautifulSoup(html, "html.parser")
-                title_tag = soup.find("h1")
-                topic = title_tag.text.strip() if title_tag else "DH Konusu"
-                if "Amazon" in topic: source_name = "Amazon TR"
-                elif "Pazarama" in topic: source_name = "Pazarama"
-                elif "N11" in topic: source_name = "N11"
-                else: source_name = topic[:15]
 
-                total_pages = self.extract_total_pages(html)
-                logger.info("%s: total %d pages", source_name, total_pages)
+        for source_name, source_info in FORUM_SOURCES.items():
+            slug = source_info["slug"]
+            total = await self._get_total_pages(slug)
+            logger.info("%s: total %d pages", source_name, total)
 
-                pages_to_scrape = [total_pages - 1, total_pages] if total_pages > 1 else [1]
-                for p_num in pages_to_scrape:
-                    if p_num <= 0: continue
-                    logger.info("Scraping: %s (page %d)", source_name, p_num)
-                    p_url = f"{url}-{p_num}" if p_num > 1 else url
-                    p_html = await self.get_page(p_url)
-                    page_posts = self.parse_posts(p_html, source_name)
-                    all_posts.extend(page_posts)
-                    logger.info("-> %d posts found", len(page_posts))
-                    await asyncio.sleep(1)
-            except Exception as e:
-                logger.error("Error scraping %s: %s", url, e)
+            pages_to_fetch = list(range(max(1, total - PAGES_TO_SCAN + 1), total + 1))
+
+            for page in pages_to_fetch:
+                posts = await self._scrape_page(slug, page, source_name)
+                all_posts.extend(posts)
+                await asyncio.sleep(REQUEST_DELAY)
+
+        logger.info("Total %d posts scraped.", len(all_posts))
         return all_posts
 
+    async def resolve_redirect(self, url: str) -> Optional[str]:
+        """Resolves forum redirect URLs (/mesaj/yonlen/...) to the actual product URL."""
+        if not url.startswith("http"):
+            url = "https://" + url
+        try:
+            async with self.client.stream("GET", url, follow_redirects=True, timeout=8) as resp:
+                final = str(resp.url)
+            if any(d in final for d in SHOPPING_DOMAINS):
+                return final
+            return str(resp.url)
+        except Exception:
+            return None
+
+
 # ===========================================================================
-# MODULE 2: VALIDATOR
+# MODULE 2: Validation & Pre-filtering
 # ===========================================================================
 class ValidationEngine:
-    BANNED_WORDS = {"ref", "referans", "davet", "yardim", "paramguvende", "satilik", "alici"}
-    BLOCKED_DOMAINS = {"youtube.com", "youtu.be", "twitter.com", "instagram.com"}
+    """
+    - Resolves forum redirect links to real product URLs.
+    - Verifies HTTP 200 status.
+    - Filters out posts with no product links.
+    """
 
-    def __init__(self, client: httpx.AsyncClient) -> None:
+    def __init__(self, client: httpx.AsyncClient, scraper: ForumScraper) -> None:
         self.client = client
+        self.scraper = scraper
 
-    def _clean_url(self, link: str) -> str:
-        return link.split("?")[0].split("#")[0]
+    async def validate_post(self, post: ForumPost) -> ForumPost:
+        """Validates a post: resolves links and checks HTTP status."""
+        if not post.raw_links:
+            post.is_valid = False
+            return post
 
-    async def _resolve_link(self, link: str) -> Optional[str]:
-        if "donanimhaber.com/store" in link:
+        resolved: list[str] = []
+        for raw in post.raw_links[:3]:
+            if "/mesaj/yonlen/" in raw or "ExternalLinkRedirect" in raw:
+                r = await self.scraper.resolve_redirect(raw)
+                if r:
+                    resolved.append(r)
+            elif any(d in raw for d in SHOPPING_DOMAINS):
+                resolved.append(raw)
+            await asyncio.sleep(0.5)
+
+        post.resolved_links = list(dict.fromkeys(resolved))
+
+        if post.resolved_links:
+            post.is_valid = True
             try:
-                r = await self.client.head(link, timeout=5)
-                return self._clean_url(str(r.url))
-            except Exception:
-                return None
-        return link
+                check_url = post.resolved_links[0]
+                async with self.client.stream("GET", check_url, follow_redirects=True, timeout=5) as resp:
+                    post.http_status = resp.status_code
+            except Exception as exc:
+                logger.debug("HTTP check error (%s): %s", post.resolved_links[0], exc)
+        else:
+            post.is_valid = False
+
+        return post
 
     async def validate_all(self, posts: list[ForumPost]) -> list[ForumPost]:
-        valid: list[ForumPost] = []
-        for p in posts:
-            if not p.text.strip(): continue
-            low_text = p.text.lower()
-            if any(b in low_text for b in self.BANNED_WORDS): continue
+        """Validates all posts concurrently with a semaphore limit."""
+        sem = asyncio.Semaphore(5)
 
-            resolved = []
-            for rlink in p.raw_links:
-                res = await self._resolve_link(rlink)
-                if not res: continue
-                domain = urlparse(res).netloc.lower()
-                if any(bd in domain for b in self.BLOCKED_DOMAINS): continue
-                resolved.append(res)
-            
-            p.resolved_links = list(set(resolved))
-            if p.resolved_links:
-                valid.append(p)
-                
-        logger.info("%d / %d posts passed validation.", len(valid), len(posts))
-        return valid
+        async def _bounded(p: ForumPost) -> ForumPost:
+            async with sem:
+                return await self.validate_post(p)
+
+        results = await asyncio.gather(*[_bounded(p) for p in posts], return_exceptions=True)
+        valid_posts: list[ForumPost] = []
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning("Validation error: %s", r)
+            elif isinstance(r, ForumPost) and r.is_valid:
+                valid_posts.append(r)
+
+        logger.info("%d / %d posts passed validation.", len(valid_posts), len(posts))
+        return valid_posts
+
 
 # ===========================================================================
-# MODULE 3: LLM AGENT
+# MODULE 3: AI Analysis
 # ===========================================================================
 class LLMAgent:
     def __init__(self) -> None:
-        if not GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY is missing!")
         self.client = genai.Client(api_key=GEMINI_API_KEY)
 
     def _discover_models(self) -> list[str]:
-        return ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-pro"]
+        return ["gemini-2.5-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]
 
     def _build_prompt(self, posts: list[ForumPost]) -> str:
         lines = [
             "GOREVIN:",
             "Sana verilen forum mesajlarindaki gecerli ve indirimli TUM URUNLERI cikar.",
-            "SAKIN eleme yapip 2-3 tane urun birakma! Mesajlarda bulunan butun linkli urunleri JSON'a ekle.",
+            "SAKIN eleme yapip 2-3 tane urun birakma! Mesajlarda bulunan butun linkli urunleri JSON'a ekle (kac tane varsa hepsi).",
             "Urunleri 'trend_firsatlar', 'elektronik', 'ev_yasam', 'supermarket', 'moda', 'oyun_hobi', 'diger' kategorilerine ayir.",
             "En iyi 5 firsati 'trend_firsatlar' icine koy.",
             "",
@@ -252,12 +383,10 @@ class LLMAgent:
             "",
             "FORUM MESAJLARI:"
         ]
-
         for i, p in enumerate(posts, 1):
             lines.append(f"[{i}] Kaynak: {p.source}")
             lines.append(f"    Mesaj: {p.text[:400]}")
-            if p.resolved_links:
-                lines.append(f"    Link: {p.resolved_links[0]}")
+            if p.resolved_links: lines.append(f"    Link: {p.resolved_links[0]}")
         return "\n".join(lines)
 
     def _json_to_html(self, data: dict, run_date: str) -> str:
@@ -271,7 +400,6 @@ class LLMAgent:
             "oyun_hobi": "🎮 Oyun & Hobi",
             "diger": "📦 Diğer"
         }
-        
         total_items = 0
         for cat_key, cat_name in categories.items():
             items = data.get(cat_key, [])
@@ -286,31 +414,22 @@ class LLMAgent:
                     bulten += f"• <b>{u_adi}</b> — <code>{fiyat}</code> | <a href='{link}'>Satın Al</a> (<i>{kaynak}</i>)\n"
                     total_items += 1
                 bulten += "\n"
-        
-        if total_items == 0:
-            return "<b>ℹ️ Bugün kazınan geçerli bir fırsat bulunamadı.</b>"
-
+        if total_items == 0: return "<b>ℹ️ Bugün kazınan geçerli bir fırsat bulunamadı.</b>"
         bulten += "<i>📅 Kaynak: DonanımHaber Forum</i>"
         return bulten
 
     async def analyze(self, posts: list[ForumPost]) -> str:
-        if not posts:
-            return "<b>ℹ️ Bugün paylaşılan geçerli bir fırsat bulunamadı.</b>"
-
+        if not posts: return "<b>ℹ️ Bugün paylaşılan geçerli bir fırsat bulunamadı.</b>"
         now = datetime.now(TZ_ISTANBUL)
         MONTHS_TR = {1: "Ocak", 2: "Şubat", 3: "Mart", 4: "Nisan", 5: "Mayıs", 6: "Haziran", 7: "Temmuz", 8: "Ağustos", 9: "Eylül", 10: "Ekim", 11: "Kasım", 12: "Aralık"}
         run_date = f"{now.day} {MONTHS_TR[now.month]} {now.year}"
-        
         prompt = self._build_prompt(posts)
-        logger.info("Sending %d posts to Gemini for JSON extraction...", len(posts))
-
-        sys_instr = "Sen profesyonel bir veri ayıklayıcısın. Metinden tüm ürünleri yakala ve SADECE JSON formatında ver."
+        sys_instr = "Tüm geçerli ürünleri bulan bir JSON API'sisin. SADECE JSON CIKTISI VER."
+        
         raw = ""
         last_error = None
-        
         for m_name in self._discover_models():
             try:
-                logger.info("Trying Gemini model: %s", m_name)
                 response = self.client.models.generate_content(
                     model=m_name,
                     contents=prompt,
@@ -318,39 +437,29 @@ class LLMAgent:
                         temperature=0.1,
                         system_instruction=sys_instr,
                         response_mime_type="application/json",
-                        max_output_tokens=8000,
+                        max_output_tokens=8192,
                     ),
                 )
                 raw = response.text or ""
                 if raw: break
             except Exception as exc:
                 last_error = exc
-
-        if not raw:
-            return f"<b>⚠️ AI analizi sırasında hata oluştu:</b> <code>{last_error}</code>"
+        if not raw: return f"<b>⚠️ AI Hatası:</b> <code>{last_error}</code>"
 
         try:
             raw_clean = raw.strip()
             if raw_clean.startswith("```"):
                 raw_clean = re.sub(r"^```(?:json)?\s*", "", raw_clean, flags=re.IGNORECASE)
                 raw_clean = re.sub(r"\s*```$", "", raw_clean)
-            
             s = raw_clean.find("{")
             e = raw_clean.rfind("}")
-            if s != -1 and e != -1:
-                raw_clean = raw_clean[s:e+1]
-                
+            if s != -1 and e != -1: raw_clean = raw_clean[s:e+1]
             data = json.loads(raw_clean)
-            bulletin = self._json_to_html(data, run_date)
-            logger.info("Bulletin successfully generated via JSON (%d chars).", len(bulletin))
-            return bulletin
+            return self._json_to_html(data, run_date)
         except Exception as e:
-            logger.error("JSON Error: %s | Raw: %s", e, raw[:200])
-            return "<b>⚠️ AI veriyi json formatına çevirirken hata yaptı.</b>"
+            return "<b>⚠️ JSON Hatası:</b>"
 
-# ===========================================================================
-# MODULE 4: NOTIFIER
-# ===========================================================================
+
 class TelegramNotifier:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self.client = client
@@ -370,10 +479,7 @@ class TelegramNotifier:
         return chunks
 
     async def send(self, text: str) -> None:
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            logger.error("Cannot send Telegram message: Credentials missing.")
-            return
-
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
         chunks = self._split(text)
         for idx, chunk in enumerate(chunks, 1):
             payload = {
@@ -385,40 +491,78 @@ class TelegramNotifier:
             try:
                 resp = await self.client.post(f"{TELEGRAM_API_BASE}/sendMessage", json=payload, timeout=15)
                 resp.raise_for_status()
-                logger.info("Telegram HTML message sent (%d/%d).", idx, len(chunks))
             except Exception as e:
-                logger.error("Telegram HTML failed (%d/%d): %s", idx, len(chunks), e)
-            if len(chunks) > 1:
-                await asyncio.sleep(1)
+                pass
+            if len(chunks) > 1: await asyncio.sleep(1)
 
-# ===========================================================================
-# MAIN FLOW
-# ===========================================================================
+
 async def main() -> None:
+    start = time.monotonic()
     logger.info("=" * 60)
-    logger.info("FirsatKaziyici v3.0 started -- %s", datetime.now(TZ_ISTANBUL).isoformat())
+    logger.info("FirsatKaziyici v3.1 started -- %s", datetime.now(TZ_ISTANBUL).isoformat())
     logger.info("=" * 60)
 
-    missing = [k for k in ["GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"] if not os.environ.get(k)]
-    
-    async with httpx.AsyncClient(headers=HEADERS, timeout=30.0, follow_redirects=True) as http_client:
+    missing = []
+    if not GEMINI_API_KEY: missing.append("GEMINI_API_KEY")
+    if not TELEGRAM_BOT_TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID: missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        logger.error("CRITICAL: Missing environment variables: %s", ", ".join(missing))
+
+    async with httpx.AsyncClient(
+        headers=HEADERS,
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        follow_redirects=True,
+    ) as http_client:
         notifier = TelegramNotifier(http_client)
         if missing:
-            return logger.error("Missing secrets: %s", missing)
+            logger.error("Execution halted due to missing secrets.")
+            return
 
         try:
+            # ---- Module 1: Scraping ----
             scraper = ForumScraper(http_client)
             raw_posts = await scraper.scrape_all()
-            if not raw_posts: return await notifier.send("<b>ℹ️ Fırsat yok.</b>")
 
-            valid_posts = await ValidationEngine(http_client).validate_all(raw_posts)
+            if not raw_posts:
+                logger.warning("No posts found, skipping bulletin.")
+                await notifier.send(
+                    "<b>\u2139\uFE0F Bugun kaz?nan gecerli firsat mesaji bulunamadi.</b>"
+                )
+                return
+
+            # ---- Module 2: Validation ----
+            validator = ValidationEngine(http_client, scraper)
+            valid_posts = await validator.validate_all(raw_posts)
+
+            # Fallback: add liked posts if too few valid ones
+            if len(valid_posts) < 3:
+                logger.info("Few valid posts, adding liked posts as fallback...")
+                liked = sorted(raw_posts, key=lambda p: p.likes, reverse=True)[:10]
+                for p in liked:
+                    if p not in valid_posts:
+                        valid_posts.append(p)
+
+            # Sort by likes descending
             valid_posts.sort(key=lambda p: p.likes, reverse=True)
 
+            # ---- Module 3: LLM Analysis ----
             agent = LLMAgent()
-            bulletin = await agent.analyze(valid_posts) # Sends ALL valid posts
+            bulletin = await agent.analyze(valid_posts)
+
+            # ---- Module 4: Telegram ----
             await notifier.send(bulletin)
-        except Exception as e:
-            logger.exception("Critical err: %s", e)
+
+        except Exception as exc:
+            logger.exception("Critical error: %s", exc)
+            try:
+                await notifier.send_error(str(exc))
+            except Exception:
+                pass
+
+    elapsed = time.monotonic() - start
+    logger.info("Done in %.1f seconds.", elapsed)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
